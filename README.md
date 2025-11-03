@@ -18,12 +18,13 @@ The core idea is a **seeded modular design** that combines a **security layer** 
 
 ## Code Structure  
 
+```
 wiretap-feedback/
 ├── estimator/          # Mutual information estimator based on f-dime
 ├── wiretap_gain.py     # Wiretap-lightcode with categorical cross-entropy
 ├── wiretap_mi.py       # Mutual information estimation
 ├── wiretap_trade.py    # Wiretap-lightcode with categorical cross-entropy and information leakage included in the loss
-
+```
 ## Usage
 
 
@@ -48,12 +49,14 @@ To evaluate the model, set the evaluation flag to `0`.
 ## Citation
 If this is helpful, please cite:
 
+```
 @article{zhou2025feedback,
   title={Feedback Lunch: Deep Feedback Codes for Wiretap Channels},
   author={Zhou, Yingyao and Devroye, Natasha and G{\"u}nl{\"u}, Onur},
   journal={arXiv preprint arXiv:2510.16620},
   year={2025}
 }
+```
 
 ## Acknowledgment
 This repository is highly based on the excellent open-source implementation from:
