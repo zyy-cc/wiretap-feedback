@@ -1,4 +1,4 @@
-# WTC-Lightcode channel with CCE loss
+# WTC-Lightcode channel with CCE loss, estimate mutual information
 import torch, time, pdb, os, random
 import numpy as np
 import torch.nn as nn
@@ -7,21 +7,216 @@ from torch import optim
 from utils import *
 from Feature_extractors_wire import FE
 import copy
-from parameters_gain import *
+from parameters_mine import *
 import matplotlib.pyplot as plt
 
 import logging
 from tqdm import tqdm
 
-import math
+from estimator.mi_classes import *
+from estimator.mi_utils import *
+
+from torch.utils.data import DataLoader, TensorDataset
+
+
+def build_disc(dx, dy, divergence, architecture="deranged", mode="gauss", device="cuda"):
+    if architecture == "deranged":
+        simple_net = Net(input_dim=dx + dy, output_dim=1)
+        return CombinedNet(simple_net, divergence).to(device)
+    elif architecture == "joint":
+        return ConcatCritic(dim=dx + dy, hidden_dim=256, layers=2, activation='relu', divergence=divergence).to(device)
+    elif architecture == "separable":
+        return SeparableCritic(dim=dx, hidden_dim=256, embed_dim=32, layers=2, activation='relu', divergence=divergence, mode=mode).to(device)
+    else:
+        raise ValueError("architecture must be 'deranged', 'joint', or 'separable'")
+
+
+def forward_loss(disc, xb, yb, *, divergence, architecture, device="cuda", alpha=1.0, buffer=None):
+    if architecture == "deranged":
+        data_uv, data_u_v = data_generation_mi(xb, yb, device=device)   
+        D1, D2 = disc(data_uv, data_u_v)                               
+        if divergence == "MINE":
+            loss, R, buffer = compute_loss_ratio(divergence, architecture, device, D_value_1=D1, D_value_2=D2, scores=None, buffer=buffer, alpha=alpha)
+        else:
+            loss, R = compute_loss_ratio(divergence, architecture, device,D_value_1=D1, D_value_2=D2, scores=None, buffer=None, alpha=alpha)
+    else:
+        scores = disc(xb, yb)
+        if divergence == "MINE":
+            loss, R, buffer = compute_loss_ratio(divergence, architecture, device, D_value_1=None, D_value_2=None, scores=scores, buffer=buffer, alpha=alpha)
+        else:
+            loss, R = compute_loss_ratio(divergence, architecture, device, D_value_1=None, D_value_2=None, scores=scores, buffer=None, alpha=alpha)
+
+    I_hat = torch.mean(torch.log(R))
+    return loss, I_hat, buffer
+
+
+def train_mi(X, Y, divergence="KL", architecture="deranged", mode="gauss", epochs=300, batch_size=5000, lr=1e-3, alpha=1.0, device="cuda", tail_frac=0.10, do_val=True, val_batches=8):
+    X = X.to(device).float(); Y = Y.to(device).float()
+    dx, dy = X.shape[1], Y.shape[1]
+
+    disc = build_disc(dx, dy, divergence, architecture, mode, device)
+    opt  = optim.Adam(disc.parameters(), lr=lr)
+
+    n = X.shape[0]; n_tr = int(0.8 * n)
+    perm = torch.randperm(n, device=device)
+    Xtr, Ytr = X[perm[:n_tr]], Y[perm[:n_tr]]
+    Xte, Yte = X[perm[n_tr:]], Y[perm[n_tr:]]
+
+    dl = DataLoader(TensorDataset(Xtr, Ytr), batch_size=batch_size, shuffle=True, drop_last=True)
+
+    buffer = None 
+    epoch_mi = []
+
+    for _ in range(epochs):
+        disc.train()
+        batch_mis = []
+        for xb, yb in dl:
+            opt.zero_grad(set_to_none=True)
+            loss, I_hat, buffer = forward_loss(disc, xb, yb, divergence=divergence, architecture=architecture, device=device, alpha=alpha, buffer=buffer)
+            loss.backward()
+            opt.step()
+            batch_mis.append(float(I_hat.detach().cpu()))
+        epoch_mi.append(float(np.mean(batch_mis)))
+
+
+    I_val = None
+    if do_val and len(Xte) >= batch_size:
+        disc.eval()
+        vals = []
+        with torch.no_grad():
+            for _ in range(val_batches):
+                idx = torch.randint(0, Xte.shape[0], (batch_size,), device=device)
+                xb, yb = Xte[idx], Yte[idx]
+                _, I_hat_val, _ = forward_loss(disc, xb, yb, divergence=divergence, architecture=architecture, device=device, alpha=alpha, buffer=buffer)
+                vals.append(float(I_hat_val.cpu()))
+        I_val = float(np.mean(vals))
+    
+    return {
+        "disc": disc,   
+        "I_trace": epoch_mi,
+        "I_val": I_val,
+        "val_pair": (Xte, Yte)
+    }
+
+
+@torch.no_grad()
+def eval_mi(disc, X, Y, divergence, architecture, device="cuda", alpha=1.0, batch_size=5000, eps=1e-8):
+    X = X.to(device).float()
+    Y = Y.to(device).float()
+    dl = DataLoader(TensorDataset(X, Y), batch_size=batch_size, shuffle=False, drop_last=False)
+    vals = []
+    for xb, yb in dl:
+        if architecture == "deranged":
+            data_uv, data_u_v = data_generation_mi(xb, yb, device=device)
+            D1, D2 = disc(data_uv, data_u_v)
+            if divergence == "MINE":
+                _, R, _ = compute_loss_ratio(divergence, architecture, device, D_value_1=D1, D_value_2=D2, scores=None, buffer=None, alpha=alpha)
+            else:
+                _, R = compute_loss_ratio(divergence, architecture, device, D_value_1=D1, D_value_2=D2, scores=None, buffer=None, alpha=alpha)
+        else:
+            scores = disc(xb, yb)
+            if divergence == "MINE":
+                _, R, _ = compute_loss_ratio(divergence, architecture, device, D_value_1=None, D_value_2=None, scores=scores, buffer=None, alpha=alpha)
+            else:
+                _, R = compute_loss_ratio(divergence, architecture, device, D_value_1=None, D_value_2=None, scores=scores, buffer=None, alpha=alpha)
+
+        Ib = torch.mean(torch.log(R.clamp_min(eps)))
+        vals.append(float(Ib.cpu()))
+    return float(np.mean(vals)) if vals else float("nan")
+
+
+def estimate_mi(model, train_mean, train_std, args, logging):
+    exp_table, log_table = get_table(args.q)
+    s = args.random_seed
+    eve_list = [args.snr1_eve]
+
+    divs   = ["MINE", "NWJ", 'HD', 'KL',  "GAN"] 
+    arch   = "deranged"
+    epochs = 300
+    batch  = 5000
+    alpha  = 1.0
+    lr     = 1e-3
+    tail_frac = 0.10  
+
+    for eve_snr in eve_list:
+        print(f"--------- eve snr {eve_snr} --------------------")
+        if args.train == 0:
+            path = f'{weights_folder}/model_weights{args.totalbatch-101}.pt'
+            print(f"Using model from {path}")
+            logging.info(f"Using model from {path}")
+            checkpoint = torch.load(path, map_location=args.device)
+            model.load_state_dict(checkpoint)
+            model = model.to(args.device)
+        model.eval()
+
+        args.numTest = 100000
+        mVec_1 = torch.randint(0, 2, (args.numTest, args.ell, args.m))
+        bVec_1 = torch.randint(0, 2, (args.numTest, args.ell, args.q - args.m))
+        combedVec_1 = torch.cat([mVec_1, bVec_1], dim=2)
+
+        s_tensor, secreVec_1_decimal, secreVec_1_binary = secrecy_encode(
+            args.q, combedVec_1, s, exp_table, log_table, args.device
+        )
+
+        std1_bob = 10 ** (-args.snr1_bob * 0.1 / 2)  # forward SNR (Bob)
+        std1_eve = 10 ** (-eve_snr       * 0.1 / 2)  # forward SNR (Eve)
+        std2_bob = 10 ** (-args.snr2_bob * 0.1 / 2)  # feedback SNR (Bob)
+        std2_eve = 10 ** (-args.snr2_eve * 0.1 / 2)  # feedback SNR (Eve)
+
+        # noise
+        fwd_noise_bob = torch.normal(0, std=std1_bob, size=(args.numTest, args.ell, args.T), requires_grad=False)
+        fb_noise_bob  = torch.normal(0, std=std2_bob,  size=(args.numTest, args.ell, args.T), requires_grad=False)
+        fwd_noise_eve = torch.normal(0, std=std1_eve, size=(args.numTest, args.ell, args.T), requires_grad=False)
+        fb_noise_eve  = torch.normal(0, std=std2_eve,  size=(args.numTest, args.ell, args.T), requires_grad=False)
+        if args.snr2_bob >= 100: fb_noise_bob = 0 * fb_noise_bob
+        if args.snr2_eve >= 100: fb_noise_eve = 0 * fb_noise_eve
+
+        with torch.no_grad():
+            preds1, received_bob, received_eve, _, _, parity_all = model(
+                None, None,
+                secreVec_1_binary.to(args.device),
+                fwd_noise_bob.to(args.device),
+                fb_noise_bob.to(args.device),
+                fwd_noise_eve.to(args.device),
+                fb_noise_eve.to(args.device),
+                isTraining=1
+            )
+
+        message  = mVec_1.reshape(args.numTest, -1).to(args.device)
+        bob      = received_bob.reshape(args.numTest, -1).to(args.device)
+        eve      = received_eve.reshape(args.numTest, -1).to(args.device)
+
+        device = args.device
+
+        results_bob = {}
+        print("------------- Mutual information: Bob -------------")
+        for d in divs:
+            print(f"----- method {d:>5s}")
+            res = train_mi(message, bob, divergence=d, architecture=arch, epochs=epochs, batch_size=batch, lr=lr, alpha=alpha, device=device, tail_frac=tail_frac, do_val=True)
+            results_bob[d] = res
+            I_eval = eval_mi(res["disc"], message, bob, divergence=d, architecture=arch, device=device, batch_size=4096)
+            print(f"Bob: {I_eval:.4f} nats, {I_eval/np.log(2):.4f} bits")
+
+        results_eve = {}
+        print("------------- Mutual information: eve -------------")
+        for d in divs:
+            print(f"----- method {d:>5s}")
+            res = train_mi(message, eve, divergence=d, architecture=arch, epochs=epochs, batch_size=batch, lr=lr, alpha=alpha, device=device, tail_frac=tail_frac, do_val=True)
+            results_eve[d] = res
+            I_eval = eval_mi(res["disc"], message, eve, divergence=d, architecture=arch, device=device, batch_size=5000)
+            print(f"Eve: {I_eval:.4f} nats, {I_eval/np.log(2):.4f} bits")
+
+
 
 def errors_bler(y_true, y_pred, device):
     y_true = y_true.to(device)
     y_pred = y_pred.to(device)
 
+    # Reshape to (batch_size, k)
     y_true = y_true.view(y_true.shape[0], -1)
     y_pred = y_pred.view(y_pred.shape[0], -1)
 
+    # Compute block errors: 1 if any bit in the block is incorrect
     block_errors = torch.any(y_true != y_pred, dim=1).float()
 
     bler_err_rate = block_errors.mean().item()  
@@ -41,7 +236,7 @@ def PAMmodulation(binary_data, k):
 
     return decimal_data, theta
 
-def PAMdemodulation(noisy_theta, k):
+def PAMdedulation(noisy_theta, k):
     """
     Input: noisy theta (num_samples, 1)
     Output: message bits (num_samples, k)
@@ -54,7 +249,7 @@ def PAMdemodulation(noisy_theta, k):
     return decimal_data, decoding_output
 
 
-################################### reliability layer ###################################
+################################### reliability encoding ###################################
 def ModelAvg(w):
     w_avg = copy.deepcopy(w[0])
     for k in w_avg.keys():
@@ -74,6 +269,7 @@ class ae_backbone(nn.Module):
 
         self.fe1 = FE(mod, NS_model, input_size, d_model)
         self.norm1 = nn.LayerNorm(d_model, eps=1e-5)
+
 
         if mod == "trx":
             self.out1 = nn.Linear(d_model, d_model)
@@ -110,7 +306,8 @@ class ae_backbone(nn.Module):
 
 
 
-################################### secrecy layer ###################################
+
+################################### secrecy encoding ###################################
 def bin2dec(binary_data, k):
     """
     Transform binary message bits to real value.
@@ -135,9 +332,7 @@ def dec2bin(decimal_data, k):
     return binary_output
 
 def gf2_exp_log_tables(q, prim_poly):
-    """ 
-    Generates exponent and log tables for GF(2^q) using the given primitive polynomial. 
-    """
+    """ Generates exponent and log tables for GF(2^q) using the given primitive polynomial. """
     field_size = 2 ** q
     exp_table = torch.zeros(field_size, dtype=torch.int64)
     log_table = torch.full((field_size,), -1, dtype=torch.int64)  # Use -1 for undefined log(0)
@@ -146,11 +341,11 @@ def gf2_exp_log_tables(q, prim_poly):
     for i in range(field_size - 1):  
         exp_table[i] = x
         log_table[x] = i  
-        x <<= 1  
-        if x & field_size:  
+        x <<= 1  # Multiply by alpha (which is x in GF(2)) left shift by 1
+        if x & field_size:  # If x exceeds 2^q, apply modulo reduction
             x ^= prim_poly
     
-    exp_table[field_size - 1] = 1  
+    exp_table[field_size - 1] = 1  # Wrap around for exponentiation
     
     return exp_table, log_table
 
@@ -166,7 +361,7 @@ def gf2_mul(a, b, exp_table, log_table, q, device):
 
     mask = (a != 0) & (b != 0)  
     if torch.any(mask):  
-        a_flat = a[mask].long()  
+        a_flat = a[mask].long()  # Extracts valid elements (1D tensor)
         b_flat = b[mask].long() 
 
         log_a = log_table[a_flat]
@@ -177,9 +372,7 @@ def gf2_mul(a, b, exp_table, log_table, q, device):
     return res
 
 def gf2_inv(a, exp_table, log_table, q, device):
-    """
-    Computes the multiplicative inverse of elements in GF(2^q).
-    """
+    """Computes the multiplicative inverse of elements in GF(2^q)."""
     field_size = 2 ** q
     res = torch.zeros_like(a).to(device)
 
@@ -192,6 +385,11 @@ def gf2_inv(a, exp_table, log_table, q, device):
     return res
 
 def get_table(q):
+    """
+    assume q = 4
+    """
+    # Primitive polynomial for GF(2^q) (assumes q=4, prim_poly=0b10011)
+    # prim_poly = 0b10011 if q == 4 else NotImplemented  # 1 + x + x^4
     if q == 3:
         prim_poly = 0b1011  # x^3 + x + 1
     elif q == 4:
@@ -213,8 +411,9 @@ def secrecy_encode(q, combinedVec, s, exp_table, log_table, device):
     batch_size = combinedVec.shape[0]
     decimal_combinedVec = bin2dec(combinedVec, q) # convert to decimal integer
     
+    # Convert s from bit-list to GF(2^q) integer
     s_tensor = torch.tensor([int(''.join(map(str, s)), 2)], dtype=torch.int64, device=device)
-    s_inverse = gf2_inv(s_tensor, exp_table, log_table, q, device) 
+    s_inverse = gf2_inv(s_tensor, exp_table, log_table, q, device) # gets the vector integer
     s_inverse = s_inverse.view(1, 1, 1).expand(batch_size, 1, 1)
     result_decimal = gf2_mul(s_inverse.to(device), decimal_combinedVec.to(device), exp_table, log_table, q, device)
     result_binary = dec2bin(result_decimal, q)
@@ -245,7 +444,7 @@ class AE(nn.Module):
 
         self.Rmodel1 = ae_backbone(args.arch, "rec", args.T, args.q, args.d_model_rec, args.dropout, args.multclass, args.dec_NS_model)
         
-        ########## Power Reallocation ###############
+        ########## Power Reallocation as in deepcode work ###############
         if self.args.reloc == 1:
             self.total_power_reloc = Power_reallocate(args)
 
@@ -269,17 +468,20 @@ class AE(nn.Module):
         1: Bob
         2: Eve
         """
+        num_samples = secreVec_1.shape[0]
         combined_noise_par1 = fwd_noise_par1 + fb_noise_par1 
         combined_noise_par2 = fwd_noise_par2 + fb_noise_par2
         for idx in range(self.args.T): 
             if idx == 0:
-                src = torch.cat([secreVec_1, torch.zeros(self.args.batchSize, args.ell, self.args.T-1).to(self.args.device), torch.zeros(self.args.batchSize, args.ell, self.args.T-1).to(self.args.device), torch.zeros(self.args.batchSize, args.ell, self.args.T-1).to(self.args.device)], dim=2)
+                src = torch.cat([secreVec_1, torch.zeros(num_samples, args.ell, self.args.T-1).to(self.args.device), torch.zeros(num_samples, args.ell, self.args.T-1).to(self.args.device), torch.zeros(num_samples, args.ell, self.args.T-1).to(self.args.device)], dim=2)
             elif idx == self.args.T-1:
                 src = torch.cat([secreVec_1, parity_all, parity_fb1, parity_fb2],dim=2)
             else:
-                src = torch.cat([secreVec_1, parity_all, torch.zeros(self.args.batchSize, args.ell, self.args.T-(idx+1) ).to(self.args.device), parity_fb1, torch.zeros(self.args.batchSize, args.ell, self.args.T-(idx+1) ).to(self.args.device), parity_fb2, torch.zeros(self.args.batchSize, args.ell, self.args.T-(idx+1) ).to(self.args.device)],dim=2)
+                src = torch.cat([secreVec_1, parity_all, torch.zeros(num_samples, args.ell, self.args.T-(idx+1) ).to(self.args.device), parity_fb1, torch.zeros(num_samples, args.ell, self.args.T-(idx+1) ).to(self.args.device), parity_fb2, torch.zeros(num_samples, args.ell, self.args.T-(idx+1) ).to(self.args.device)],dim=2)
             output = self.Tmodel(src)
-                                    
+                        
+            ############# Generate the output ###################################################
+            
             parity, x_mean, x_std = self.power_constraint(output, isTraining, train_mean, train_std, idx)
 
             if self.args.reloc == 1:
@@ -307,166 +509,9 @@ class AE(nn.Module):
         
         return decSeq1, received1, received2, x_mean_total, x_std_total, parity_all
 
-
-def train_model(model, args, logging, initial_weights_path = None):
-    if initial_weights_path and os.path.exists(initial_weights_path):
-        print(f"Loading initial weights from {initial_weights_path}")
-        checkpoint = torch.load(initial_weights_path, map_location=args.device)
-        model.load_state_dict(checkpoint)
-    else:
-        print("No initial weights provided, training from scratch")
-
-    # security layer
-    exp_table, log_table = get_table(args.q)
-    print("-->-->-->-->-->-->-->-->-->--> start training ...")
-    logging.info("-->-->-->-->-->-->-->-->-->--> start training ...")
-    model.train()
-    start = time.time()
-    epoch_loss_record = []
-    flag = 0
-    
-    pbar = tqdm(range(args.totalbatch))
-    train_mean = torch.zeros(args.T, 1).to(args.device)
-    train_std = torch.zeros(args.T, 1).to(args.device)
-    
-    pktErrors1 = 0
-    secrey_pktErrors1 = 0
-    for eachbatch in pbar:
-        mVec_1 = torch.randint(0, 2, (args.batchSize, args.ell, args.m))
-        bVec_1 = torch.randint(0, 2, (args.batchSize, args.ell, args.q - args.m))
-        combedVec_1 = torch.cat([mVec_1, bVec_1], dim = 2)
-
-        s_tensor, secreVec_1_decimal, secreVec_1_binary = secrecy_encode(args.q, combedVec_1, args.random_seed, exp_table, log_table, args.device)
-        
-        snr2_bob = args.snr2_bob
-        snr2_eve = args.snr2_eve
-        if eachbatch < 0:
-            snr1_bob=4* (1-eachbatch/(args.core * 30000))+ (eachbatch/(args.core * 30000)) * args.snr1_bob
-            snr1_eve=4* (1-eachbatch/(args.core * 30000))+ (eachbatch/(args.core * 30000)) * args.snr1_eve
-        else:
-            snr1_bob=args.snr1_bob
-            snr1_eve=args.snr1_eve
-        
-        std1_bob = 10 ** (-snr1_bob * 1.0 / 10 / 2) #forward snr
-        std1_eve = 10 ** (-snr1_eve * 1.0 / 10 / 2) #forward snr
-
-        std2_bob = 10 ** (-snr2_bob * 1.0 / 10 / 2) #feedback snr
-        std2_eve = 10 ** (-snr2_eve * 1.0 / 10 / 2) #feedback snr
-
-        # Noise values for the parity bits
-        fwd_noise_bob = torch.normal(0, std=std1_bob, size=(args.batchSize, args.ell, args.T), requires_grad=False)
-        fb_noise_bob = torch.normal(0, std=std2_bob, size=(args.batchSize, args.ell, args.T), requires_grad=False)
-        fwd_noise_eve = torch.normal(0, std=std1_eve, size=(args.batchSize, args.ell, args.T), requires_grad=False)
-        fb_noise_eve = torch.normal(0, std=std2_eve, size=(args.batchSize, args.ell, args.T), requires_grad=False)
-        if args.snr2_bob >= 100:
-            fb_noise_bob = 0* fb_noise_bob
-        if args.snr2_eve >= 100:
-            fb_noise_eve = 0* fb_noise_eve
-
-        if np.mod(eachbatch, args.core) == 0:
-            w_locals = []
-            w0 = model.state_dict()
-            w0 = copy.deepcopy(w0)
-        else:
-            # Use the common model to have a large batch strategy
-            model.load_state_dict(w0)
-
-        # feed into model to get predictions
-        preds1, received_bob, received_eve, batch_mean, batch_std, parity_all = model(None, None, secreVec_1_binary.to(args.device), fwd_noise_bob.to(args.device), fb_noise_bob.to(args.device), fwd_noise_eve.to(args.device), fb_noise_eve.to(args.device), isTraining=1)
-        if batch_mean is not None:
-            train_mean += batch_mean
-            train_std += batch_std 
-
-        args.optimizer.zero_grad()
-
-        ys1 = secreVec_1_decimal.long().contiguous().view(-1)
-        preds1 = preds1.contiguous().view(-1, preds1.size(-1)) 
-        preds1 = torch.log(preds1)
-
-        
-        loss = F.nll_loss(preds1, ys1.to(args.device))
-
-        probs1, decodeds1 = preds1.max(dim=1)
-        decisions1 = decodeds1 != ys1.to(args.device)
-
-        pktErrors1 += decisions1.view(args.batchSize, args.ell).sum(1).count_nonzero()
-        PER1 = pktErrors1 / (eachbatch + 1) / args.batchSize
-
-
-        loss.backward()
-
-
-        secre_decode_input = decodeds1.reshape(-1, 1, 1)
-        secre_decode_output = secrecy_decode(args.q, secre_decode_input, s_tensor, args.m, exp_table, log_table)
-        secre_decode_output = secre_decode_output.to(device)
-        mVec_1 = mVec_1.to(device)
-        secrey_pktErrors1 += torch.sum((mVec_1 != secre_decode_output).any(dim=2).float())
-
-        ####################### Gradient Clipping optional ###########################
-        torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_th)
-        ##############################################################################
-        args.optimizer.step()
-        # Save the model
-        w1 = model.state_dict()
-        w_locals.append(copy.deepcopy(w1))
-        ###################### untill core number of iterations are completed ####################
-        if np.mod(eachbatch, args.core) != args.core - 1:
-            continue
-        else:
-            ########### When core number of models are obtained #####################
-            w2 = ModelAvg(w_locals) # Average the models
-            model.load_state_dict(copy.deepcopy(w2))
-            ##################### change the learning rate ##########################
-            if args.use_lr_schedule:
-                args.scheduler.step()
-        ################################ Observe test accuracy ##############################
-        if eachbatch%100000 == 0:
-            with torch.no_grad():
-                print(f"\nGBAF train stats: batch#{eachbatch}, lr {args.lr}, snr1 bob {args.snr1_bob}, snr2 bob {args.snr2_bob}, snr1 eve {args.snr1_eve}, snr2 eve {args.snr2_eve}, BS {args.batchSize}, Loss {round(loss.item(), 8)}, PER1 {round(PER1.item(), 10)}")
-                logging.info(f"\nGBAF train stats: batch#{eachbatch}, lr {args.lr}, snr1 bob {args.snr1_bob}, snr2 bob {args.snr2_bob}, snr1 eve {args.snr1_eve}, snr2 eve {args.snr2_eve}, BS {args.batchSize}, Loss {round(loss.item(), 8)}, PER1 {round(PER1.item(), 10)}")		
-   
-                # test with large batch every 1000 batches
-                print("Testing started: ... ")
-                logging.info("Testing started: ... ")
-                # change batch size to 10x for testing
-                args.batchSize = int(args.batchSize*10)
-                EvaluateNets(model, None, None, args, logging)
-                args.batchSize = int(args.batchSize/10)
-                print("... finished testing")
-    
-        ####################################################################################
-        if np.mod(eachbatch, args.core * 10000) == args.core - 1:
-            epoch_loss_record.append(loss.item())
-            if not os.path.exists(weights_folder):
-                os.mkdir(weights_folder)
-            torch.save(epoch_loss_record, f'{weights_folder}/loss')
-
-        if np.mod(eachbatch, args.core * 10000) == args.core - 1:# and eachbatch >= 80000:
-            if not os.path.exists(weights_folder):
-                os.mkdir(weights_folder)
-            saveDir = f'{weights_folder}/model_weights' + str(eachbatch) + '.pt'
-            torch.save(model.state_dict(), saveDir)
-        pbar.update(1)
-        pbar.set_description(f"GBAF train stats: batch#{eachbatch}, Loss {round(loss.item(), 8)}")
-
-        # kill the training if the loss is nan
-        if np.isnan(loss.item()):
-            print("Loss is nan, killing the training")
-            logging.info("Loss is nan, killing the training")
-            break
-  
-    pbar.close()
-
-    if train_mean is not None:
-        train_mean = train_mean / args.totalbatch
-        train_std = train_std / args.totalbatch	# not the best way but numerically stable
-      
-    return train_mean, train_std
-
 def EvaluateNets(model, train_mean, train_std, args, logging):
     exp_table, log_table = get_table(args.q)
     if args.train == 0:
-
         path = f'{weights_folder}/model_weights{args.totalbatch-101}.pt'
         print(f"Using model from {path}")
         logging.info(f"Using model from {path}")
@@ -481,6 +526,7 @@ def EvaluateNets(model, train_mean, train_std, args, logging):
 
     args.numTestbatch = 100000000
     
+
     symErrors1 = 0
     pktErrors1 = 0
 
@@ -525,11 +571,9 @@ def EvaluateNets(model, train_mean, train_std, args, logging):
             probs1, decodeds1 = preds1.max(dim=1)
             decisions1 = decodeds1 != ys1.to(args.device)
         
-
             symErrors1 += decisions1.sum()
             SER1 = symErrors1 / (eachbatch + 1) / args.batchSize / args.ell
             
-
             pktErrors1 += decisions1.view(args.batchSize, args.ell).sum(1).count_nonzero()
             PER1 = pktErrors1 / (eachbatch + 1) / args.batchSize
            
@@ -538,7 +582,7 @@ def EvaluateNets(model, train_mean, train_std, args, logging):
             num_pkts = num_batches_ran * args.batchSize	
 
             secre_decode_input = decodeds1.reshape(-1, 1, 1)
-            secre_decode_output = secrecy_decode(args.q, secre_decode_input, s_tensor, args.m, exp_table, log_table)          
+            secre_decode_output = secrecy_decode(args.q, secre_decode_input, s_tensor, args.m, exp_table, log_table)            ######################################################################################################################## 
             secre_decode_output = secre_decode_output.to(device)
             mVec_1 = mVec_1.to(device)
             secrey_pktErrors1 += torch.sum((mVec_1 != secre_decode_output).any(dim=2).float())
@@ -568,6 +612,9 @@ def EvaluateNets(model, train_mean, train_std, args, logging):
     logging.info(f"Final test SER1 = {torch.mean(SER1).item()}, at snr1 bob {args.snr1_bob}, snr2 bob {args.snr2_bob}, snr1 eve {args.snr1_eve}, snr2 eve {args.snr2_eve} for rate {args.m}/{args.T}")
     logging.info(f"Final test PER1 = {torch.mean(PER1).item()}, at snr1 bob {args.snr1_bob}, snr2 bob {args.snr2_bob}, snr1 eve {args.snr1_eve}, snr2 eve {args.snr2_eve} for rate {args.m}/{args.T}")
 
+
+
+
 if __name__ == '__main__':
     # ======================================================= parse args
     args = args_parser(True)
@@ -589,10 +636,8 @@ if __name__ == '__main__':
     if 'cuda' in args.device:
         torch.backends.cudnn.benchmark = True
  
-    # ======================================================= Initialize the model
     model = AE(args).to(args.device)
-  
-    # configure the logging
+
     folder_str = f"T_{args.T}/pow_{args.reloc}/{args.batchSize}/{args.lr}/"
     sim_str = f"K_{args.K}_m_{args.m}_q{args.q}_snr1bob_{args.snr1_bob}_snr1eve_{args.snr1_eve}"
  
@@ -610,6 +655,7 @@ if __name__ == '__main__':
     os.makedirs(weights_folder, exist_ok=True)
 
 
+    # ======================================================= run
     if args.train == 1:
         if args.opt_method == 'adamW':
             args.optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.999), eps=1e-08, weight_decay=args.wd, amsgrad=False)
@@ -639,8 +685,7 @@ if __name__ == '__main__':
         print(f"Total number of trainable parameters in Rmodel1: {num_params}")
         logging.info(f"Total number of trainable parameters in Rmodel1: {num_params}")
 
-
-        train_mean, train_std = train_model(model, args, logging, None)
+        train_mean, train_std = train_model(model, args, logging)
 
         # stop training and test
         args.train = 0
@@ -662,10 +707,10 @@ if __name__ == '__main__':
     logging.info("\nInference using trained model and stats from large dataset: ... ")
 
     path = f'{weights_folder}/model_weights{args.totalbatch-101}.pt'
+
     print(f"\nUsing model from {path}")
     logging.info(f"\nUsing model from {path}")
  
-    # use one very large batch to compute mean and std
     large_bs = int(1e6)
     args.batchSize = large_bs
     checkpoint = torch.load(path,map_location=args.device)
@@ -681,6 +726,7 @@ if __name__ == '__main__':
     combedVec_1 = torch.cat([mVec_1, bVec_1], dim = 2)
 
     exp_table, log_table = get_table(args.q)
+
     s_tensor, secreVec_1_decimal, secreVec_1_binary = secrecy_encode(args.q, combedVec_1, args.random_seed, exp_table, log_table, args.device)
 
     # generate n sequence 
@@ -696,15 +742,13 @@ if __name__ == '__main__':
     fwd_noise_eve = torch.normal(0, std=std1_eve, size=(args.batchSize, args.ell, args.T), requires_grad=False)
     fb_noise_eve = torch.normal(0, std=std2_eve, size=(args.batchSize, args.ell, args.T), requires_grad=False)
     if args.snr2_bob >= 100:
-        fb_noise_bob = 0* fb_noise_bob
+        fb_noise_bob = 0 * fb_noise_bob
     if args.snr2_eve >= 100:
-        fb_noise_eve = 0* fb_noise_eve
+        fb_noise_eve = 0 * fb_noise_eve
 
     # feed into model to get predictions
     with torch.no_grad():
         preds1, received_bob, received_eve, train_mean, train_std, parity_all = model(None, None, secreVec_1_binary.to(args.device), fwd_noise_bob.to(args.device), fb_noise_bob.to(args.device), fwd_noise_eve.to(args.device), fb_noise_eve.to(args.device), isTraining=1)
 
     EvaluateNets(model, train_mean, train_std, args, logging)
-
-
-    
+    estimate_mi(model, train_mean, train_std, args, logging)

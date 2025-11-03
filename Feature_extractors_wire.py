@@ -9,7 +9,6 @@ class FE(nn.Module):
         super(FE, self).__init__()
         self.mod = mod
         self.NS_model = NS_model
-        # self.reserve = 3 + 8
         if self.NS_model == 0:
             self.FC1 = nn.Linear(input_size, d_model, bias=True)
         elif self.NS_model == 1:
@@ -44,13 +43,7 @@ class FE(nn.Module):
             x1 = self.FC1(src)
             x1 = self.FC2(self.activation1(x1))
             x1 = self.FC3(self.activation2(x1))
-            if self.mod == 'trx': 
-                src1 = src * (-1)
-            elif self.mod == 'rec':
-                src1 = src * (-1)
-            elif self.mod == 'rec2': 
-                src1 = src * (-1)
-
+            src1 = src * (-1)
             x2 = self.FC1(src1)
             x2 = self.FC2(self.activation1(x2))
             x2 = self.FC3(self.activation2(x2))

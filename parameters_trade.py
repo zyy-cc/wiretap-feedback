@@ -1,4 +1,3 @@
-# WTC-Lightcode channel with CCE loss
 import argparse
 
 device = 'cuda:0'
@@ -10,9 +9,9 @@ q = 4
 T = 9
 
 
-train = 0   # 0: test, 1: train
+train = 1
 
-seed = 144
+seed = 154
 
 arch = "1xfe" 
 features = "fy" 
@@ -22,12 +21,20 @@ def args_parser(jupyter_notebook):
     parser = argparse.ArgumentParser()
 
     # Sequence arguments
-    parser.add_argument('--snr1_bob', type=int, default= 0, help="Transmission SNR for Bob")
-    parser.add_argument('--snr1_eve', type=int, default= 0, help="Transmission SNR for Eve")
-    parser.add_argument('--snr2_bob', type=int, default= 100, help="Feedback SNR for Bob")
-    parser.add_argument('--snr2_eve', type=int, default= 100, help="Feedback SNR for Eve")
-    parser.add_argument('--random_seed', type=list, default= [1, 1, 0, 1], help="random seed for the security layer")
-    
+    parser.add_argument('--snr1_bob', type=int, default= 1, help="Transmission SNR for Bob")
+    parser.add_argument('--snr1_eve', type=int, default= 1, help="Transmission SNR for Eve")
+    parser.add_argument('--snr2_bob', type=int, default= 5, help="Feedback SNR for Bob")
+    parser.add_argument('--snr2_eve', type=int, default= 5, help="Feedback SNR for Eve")
+    parser.add_argument('--random_seed', type=list, default= [1, 1, 0, 1], help="random seed s")
+
+    # secrecy constraint
+    parser.add_argument('--tau_bits', type=float, default=0.9, help="secrecy_constraint bits")
+    parser.add_argument('--beta_lr', type=float, default=0.01, help="beta learning rate")
+    parser.add_argument('--mi_epochs', type=int, default=300, help="MI epochs")
+    parser.add_argument('--mi_batch', type=int, default=5000, help="MI batch size")
+    parser.add_argument('--cycle', type=int, default=50, help="The number of iterations when you re-train MI")
+
+
     parser.add_argument('--K', type=int, default=K, help="Sequence length")
     parser.add_argument('--m', type=int, default=m, help="Block size")
     parser.add_argument('--ell', type=int, default=ell, help="Number of bit blocks")
@@ -50,7 +57,7 @@ def args_parser(jupyter_notebook):
     parser.add_argument('--load_weights') # None
     parser.add_argument('--train', type=int, default= train)
     parser.add_argument('--reloc', type=int, default=1, help="w/ or w/o power rellocation")
-    parser.add_argument('--totalbatch', type=int, default=120101, help="number of total batches to train")
+    parser.add_argument('--totalbatch', type=int, default=8010, help="number of total batches to train")
     parser.add_argument('--batchSize', type=int, default=batchSize, help="batch size")
     parser.add_argument('--opt_method', type=str, default='adamW', help="Optimization method adamW,lamb,adam")
     parser.add_argument('--clip_th', type=float, default=0.5, help="clipping threshold")
@@ -72,5 +79,3 @@ def args_parser(jupyter_notebook):
         args = parser.parse_args()    # in general
 
     return args
-
-

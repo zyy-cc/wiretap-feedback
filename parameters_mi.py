@@ -1,4 +1,3 @@
-# WTC-Lightcode channel with CCE loss
 import argparse
 
 device = 'cuda:0'
@@ -10,7 +9,7 @@ q = 4
 T = 9
 
 
-train = 0   # 0: test, 1: train
+train = 0
 
 seed = 144
 
@@ -22,8 +21,8 @@ def args_parser(jupyter_notebook):
     parser = argparse.ArgumentParser()
 
     # Sequence arguments
-    parser.add_argument('--snr1_bob', type=int, default= 0, help="Transmission SNR for Bob")
-    parser.add_argument('--snr1_eve', type=int, default= 0, help="Transmission SNR for Eve")
+    parser.add_argument('--snr1_bob', type=int, default= 1, help="Transmission SNR for Bob")
+    parser.add_argument('--snr1_eve', type=int, default= 1, help="Transmission SNR for Eve")
     parser.add_argument('--snr2_bob', type=int, default= 100, help="Feedback SNR for Bob")
     parser.add_argument('--snr2_eve', type=int, default= 100, help="Feedback SNR for Eve")
     parser.add_argument('--random_seed', type=list, default= [1, 1, 0, 1], help="random seed for the security layer")
@@ -72,5 +71,3 @@ def args_parser(jupyter_notebook):
         args = parser.parse_args()    # in general
 
     return args
-
-
